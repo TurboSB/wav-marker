@@ -1,17 +1,16 @@
-//
-// wavecuepoint.c
-// Created by Jim McGowan on 29/11/12.
-// Turned into command-line utility by David Hilowitz on 19/11/16.
-// jim@bleepsandpops.com
-// jim@malkinware.com
-//
-// This function reads a .wav file and a text file containing marker locations (specified as frame indexes, one per line)
-// and creates a new .wav file with embedded cue points for each location.  The code is standard, portable C.
-//
-// For a full description see http://bleepsandpops.com/post/37792760450/adding-cue-points-to-wav-files-in-c
-//
-// THIS CODE IS GIVEN TO THE PUBLIC DOMAIN
-//
+/** @file wav-labeler.c
+ *
+ * @author Mike Bucceroni
+ * @date 2023-02-04
+ * @details program reads a .wav file and a label file as exported by Audacity
+ * and creates a new .wav file with embedded cue points and text for each label
+ * in a format that works with the podcasting application Forecast
+ *
+ * Extended from wavecuepoint.c
+ * Originally created by Jim McGowan on 2012-11-29
+ * Turned into a commandline utility by David Hilowitz on 2016-11-19
+ * And modified by Tim Moore on 2022-10-14
+ */
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -19,7 +18,7 @@
 #include <string.h>
 
 #include <ctype.h>
-#include <unistd.h>
+#include <unistd.h> //not sure if this is needed
 
 #define WAVE_FORMAT_PCM 0x0001
 #define WAVE_FORMAT_IEEE_FLOAT 0x0003
@@ -47,7 +46,7 @@ typedef struct
     char significantBitsPerSample[2]; // Unsigned 2-byte little endian int
 } FormatChunk;
 
-// CuePoint: each individual 'marker' in a wave file is represented by a cue point.
+// CuePoint: each individual 'label' in a wave file is represented by a cue point.
 typedef struct
 {
     char cuePointID[4];        // a unique ID for the Cue Point.
@@ -79,10 +78,11 @@ typedef struct
 {
     uint32_t locations[1000];
     uint32_t count;
-} CueLocations;
-CueLocations readCueLocationsFromMarkerFile(FILE *markerFile);
+} LabelInfo;
 
-int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, CueLocations cueLocations, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk);
+LabelInfo readLabelFile(FILE *labelFile);
+
+int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, LabelInfo labelInfo, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk);
 
 // For such chunks that we will copy over from input to output, this function does that in 1MB pieces
 int writeChunkLocationFromInputFileToOutputFile(ChunkLocation chunk, FILE *inputFile, FILE *outputFile);
@@ -115,7 +115,7 @@ enum CuePointMergingOption
     ReplaceAnyExistingCuePoints
 };
 
-static int addMarkersToWaveFile(char *inFilePath, char *markerFilePath, char *outFilePath, enum CuePointMergingOption mergeOption)
+static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outFilePath, enum CuePointMergingOption mergeOption)
 {
 
     int returnCode = 0;
@@ -135,7 +135,7 @@ static int addMarkersToWaveFile(char *inFilePath, char *markerFilePath, char *ou
     int otherChunksCount = 0;
     ChunkLocation otherChunkLocations[maxOtherChunks];
 
-    FILE *markersFile = NULL;
+    FILE *labelFile = NULL;
     CueChunk cueChunk = {
         .chunkID = {0},
         .chunkDataSize = {0},
@@ -153,11 +153,11 @@ static int addMarkersToWaveFile(char *inFilePath, char *markerFilePath, char *ou
         goto CleanUpAndExit;
     }
 
-    // Open the Markers file
-    markersFile = fopen(markerFilePath, "rb");
-    if (markersFile == NULL)
+    // Open the Label file
+    labelFile = fopen(labelFilePath, "rb");
+    if (labelFile == NULL)
     {
-        fprintf(stderr, "Could not open marker file %s\n", markerFilePath);
+        fprintf(stderr, "Could not open label file %s\n", labelFilePath);
         returnCode = -1;
         goto CleanUpAndExit;
     }
@@ -403,23 +403,23 @@ static int addMarkersToWaveFile(char *inFilePath, char *markerFilePath, char *ou
         goto CleanUpAndExit;
     }
 
-    // Read in the Markers File
-    fprintf(stdout, "Reading markers file.\n");
+    // Read in the Label File
+    fprintf(stdout, "Reading label file.\n");
 
-    CueLocations cueLocations = readCueLocationsFromMarkerFile(markersFile);
+    LabelInfo labelInfo = readLabelFile(labelFile);
 
-    // Did we get any cueLocations?
-    if (cueLocations.count < 1)
+    // Did we get any LabelInfo?
+    if (labelInfo.count < 1)
     {
-        fprintf(stderr, "Did not find any cue point locations in the markers file\n");
+        fprintf(stderr, "Did not find any cue point locations in the label file\n");
         returnCode = -1;
         goto CleanUpAndExit;
     }
 
-    fprintf(stdout, "Read %d cue locations from markers file.\nPreparing new cue chunk.\n", cueLocations.count);
+    fprintf(stdout, "Read %d cue locations from label file.\nPreparing new cue chunk.\n", labelInfo.count);
 
     // Create CuePointStructs for each cue location
-    cueChunk.cuePoints = malloc(sizeof(CuePoint) * cueLocations.count);
+    cueChunk.cuePoints = malloc(sizeof(CuePoint) * labelInfo.count);
     if (cueChunk.cuePoints == NULL)
     {
         fprintf(stderr, "Memory Allocation Error: Could not allocate memory for Cue Points data\n");
@@ -430,17 +430,17 @@ static int addMarkersToWaveFile(char *inFilePath, char *markerFilePath, char *ou
     //    uint16_t bitsPerSample = littleEndianBytesToUInt16(formatChunk->significantBitsPerSample);
     //    uint16_t bytesPerSample = bitsPerSample / 8;
 
-    for (uint32_t i = 0; i < cueLocations.count; i++)
+    for (uint32_t i = 0; i < labelInfo.count; i++)
     {
         uint32ToLittleEndianBytes(i + 1, cueChunk.cuePoints[i].cuePointID);
-        uint32ToLittleEndianBytes(cueLocations.locations[i], cueChunk.cuePoints[i].playOrderPosition);
+        uint32ToLittleEndianBytes(labelInfo.locations[i], cueChunk.cuePoints[i].playOrderPosition);
         cueChunk.cuePoints[i].dataChunkID[0] = 'd';
         cueChunk.cuePoints[i].dataChunkID[1] = 'a';
         cueChunk.cuePoints[i].dataChunkID[2] = 't';
         cueChunk.cuePoints[i].dataChunkID[3] = 'a';
         uint32ToLittleEndianBytes(0, cueChunk.cuePoints[i].chunkStart);
         uint32ToLittleEndianBytes(0, cueChunk.cuePoints[i].blockStart);
-        uint32ToLittleEndianBytes(cueLocations.locations[i], cueChunk.cuePoints[i].frameOffset);
+        uint32ToLittleEndianBytes(labelInfo.locations[i], cueChunk.cuePoints[i].frameOffset);
     }
 
     // If necesary, merge the cuePoints with any existing cue points from the input file
@@ -454,8 +454,8 @@ static int addMarkersToWaveFile(char *inFilePath, char *markerFilePath, char *ou
     cueChunk.chunkID[1] = 'u';
     cueChunk.chunkID[2] = 'e';
     cueChunk.chunkID[3] = ' ';
-    uint32ToLittleEndianBytes(4 + (sizeof(CuePoint) * cueLocations.count), cueChunk.chunkDataSize); // See struct definition
-    uint32ToLittleEndianBytes(cueLocations.count, cueChunk.cuePointsCount);
+    uint32ToLittleEndianBytes(4 + (sizeof(CuePoint) * labelInfo.count), cueChunk.chunkDataSize); // See struct definition
+    uint32ToLittleEndianBytes(labelInfo.count, cueChunk.cuePointsCount);
 
     // Open the output file for writing
     outputFile = fopen(outFilePath, "wb");
@@ -466,7 +466,7 @@ static int addMarkersToWaveFile(char *inFilePath, char *markerFilePath, char *ou
         goto CleanUpAndExit;
     }
 
-    returnCode = writeOutputFile(inputFile, outputFile, formatChunkExtraBytes, dataChunkLocation, otherChunksCount, otherChunkLocations, cueLocations, waveHeader, formatChunk, cueChunk);
+    returnCode = writeOutputFile(inputFile, outputFile, formatChunkExtraBytes, dataChunkLocation, otherChunksCount, otherChunkLocations, labelInfo, waveHeader, formatChunk, cueChunk);
     if (returnCode < 0)
     {
         goto CleanUpAndExit;
@@ -484,8 +484,8 @@ CleanUpAndExit:
         free(formatChunk);
     if (existingCueChunk.cuePoints != NULL)
         free(existingCueChunk.cuePoints);
-    if (markersFile != NULL)
-        fclose(markersFile);
+    if (labelFile != NULL)
+        fclose(labelFile);
     if (cueChunk.cuePoints != NULL)
         free(cueChunk.cuePoints);
     if (outputFile != NULL)
@@ -494,27 +494,27 @@ CleanUpAndExit:
     return returnCode;
 }
 
-CueLocations readCueLocationsFromMarkerFile(FILE *markersFile)
+LabelInfo readLabelFile(FILE *labelFile)
 {
-    // The markers file should contain a locations for each marker (cue point), one location per line
-    CueLocations cueLocations = {
+    // The label file should follow the standard format exported by audacity "startTime(sec) \t endTime(sec) \t Label \n"
+    LabelInfo labelInfo = {
         .locations = {0},
         .count = 0};
 
-    while (!feof(markersFile))
+    while (!feof(labelFile))
     {
-        char cueLocationString[11] = {0}; // Max Value for a 32 bit int is 4,294,967,295, i.e. 10 numeric digits, so char[11] should be enough storage for all the digits in a line + a terminator (\0).
+        char labelInfotring[11] = {0}; // Max Value for a 32 bit int is 4,294,967,295, i.e. 10 numeric digits, so char[11] should be enough storage for all the digits in a line + a terminator (\0).
         int charIndex = 0;
 
-        // Loop through each line in the markers file
+        // Loop through each line in the label file
         while (1)
         {
-            int nextChar = fgetc(markersFile);
+            int nextChar = fgetc(labelFile);
 
             // check for end of file
-            if (feof(markersFile))
+            if (feof(labelFile))
             {
-                cueLocationString[charIndex] = '\0';
+                labelInfotring[charIndex] = '\0';
                 break;
             }
 
@@ -523,63 +523,63 @@ CueLocations readCueLocationsFromMarkerFile(FILE *markersFile)
             {
                 // This is a Classic Mac line ending '\r' or the start of a Windows line ending '\r\n'
                 // If this is the start of a '\r\n', gobble up the '\n' too
-                int peekAheadChar = fgetc(markersFile);
+                int peekAheadChar = fgetc(labelFile);
                 if ((peekAheadChar != EOF) && (peekAheadChar != '\n'))
                 {
-                    ungetc(peekAheadChar, markersFile);
+                    ungetc(peekAheadChar, labelFile);
                 }
 
-                cueLocationString[charIndex] = '\0';
+                labelInfotring[charIndex] = '\0';
                 break;
             }
             if (nextChar == '\n')
             {
                 // This is a Unix/ OS X line ending '\n'
-                cueLocationString[charIndex] = '\0';
+                labelInfotring[charIndex] = '\0';
                 break;
             }
 
             if ((nextChar == '0') || (nextChar == '1') || (nextChar == '2') || (nextChar == '3') || (nextChar == '4') || (nextChar == '5') || (nextChar == '6') || (nextChar == '7') || (nextChar == '8') || (nextChar == '9'))
             {
-                // This is a regular numeric character, if there are less than 10 digits in the cueLocationString, add this character.
+                // This is a regular numeric character, if there are less than 10 digits in the labelInfotring, add this character.
                 // More than 10 digits is too much for a 32bit unsigned integer, so ignore this character and spin through the loop until we hit EOL or EOF
                 if (charIndex < 10)
                 {
-                    cueLocationString[charIndex] = (char)nextChar;
+                    labelInfotring[charIndex] = (char)nextChar;
                     charIndex++;
                 }
                 else
                 {
-                    fprintf(stderr, "Line %d in marker file contains too many numeric digits (>10). Max value for a sample location is 4,294,967,295\n", cueLocations.count + 1);
+                    fprintf(stderr, "Line %d in label file contains too many numeric digits (>10). Max value for a sample location is 4,294,967,295\n", labelInfo.count + 1);
                 }
             }
             else
             {
                 // This is an invalid character
-                fprintf(stderr, "Invalid character in marker file: \'%c\' at line %d column %d.  Ignoring this character\n", nextChar, cueLocations.count + 1, charIndex + 1);
+                fprintf(stderr, "Invalid character in label file: \'%c\' at line %d column %d.  Ignoring this character\n", nextChar, labelInfo.count + 1, charIndex + 1);
             }
         }
 
-        // Convert the digits from the line to a uint32 and add to cueLocations
-        if (strlen(cueLocationString) > 0)
+        // Convert the digits from the line to a uint32 and add to labelInfo
+        if (strlen(labelInfotring) > 0)
         {
-            long cueLocation_Long = strtol(cueLocationString, NULL, 10);
+            long cueLocation_Long = strtol(labelInfotring, NULL, 10);
             if (cueLocation_Long < UINT32_MAX)
             {
-                cueLocations.locations[cueLocations.count] = (uint32_t)cueLocation_Long;
-                cueLocations.count++;
+                labelInfo.locations[labelInfo.count] = (uint32_t)cueLocation_Long;
+                labelInfo.count++;
             }
             else
             {
-                fprintf(stderr, "Line %d in marker file contains a value larger than the max possible sample location value\n", cueLocations.count + 1);
+                fprintf(stderr, "Line %d in label file contains a value larger than the max possible sample location value\n", labelInfo.count + 1);
             }
         }
     }
 
-    return cueLocations;
+    return labelInfo;
 }
 
-int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, CueLocations cueLocations, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk)
+int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, LabelInfo labelInfo, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk)
 {
     fprintf(stdout, "Writing output file.\n");
 
@@ -610,7 +610,7 @@ int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunk
     fileDataSize += 4; // 4 bytes for CueChunk ID "cue "
     fileDataSize += 4; // UInt32 for CueChunk.chunkDataSize
     fileDataSize += 4; // UInt32 for CueChunk.cuePointsCount
-    fileDataSize += (sizeof(CuePoint) * cueLocations.count);
+    fileDataSize += (sizeof(CuePoint) * labelInfo.count);
 
     uint32ToLittleEndianBytes(fileDataSize, waveHeader->dataSize);
 
@@ -872,7 +872,7 @@ int main(int argc, char **argv)
 {
     enum CuePointMergingOption mflag = ReplaceAnyExistingCuePoints;
     char *inFilePath = NULL;
-    char *markerFilePath = NULL;
+    char *labelFilePath = NULL;
     char *outFilePath = NULL;
     int index;
     int c;
@@ -898,17 +898,17 @@ int main(int argc, char **argv)
 
     if ((argc - optind) != 3)
     {
-        printf("Usage: wavecuepoint [-m] WAVFILE MARKERFILE OUTPUTFILE\nOptions:\n\t-m\tMerge any existing cue points (default is replace)\n");
+        printf("Usage: wavecuepoint [-m] WAVFILE labelFILE OUTPUTFILE\nOptions:\n\t-m\tMerge any existing cue points (default is replace)\n");
         return 1;
     }
 
     index = optind;
     inFilePath = argv[index++];
-    markerFilePath = argv[index++];
+    labelFilePath = argv[index++];
     outFilePath = argv[index++];
 
-    printf("mflag = %d, inFilePath = %s, markerFilePath = %s, outFilePath = %s\n",
-           mflag, inFilePath, markerFilePath, outFilePath);
+    printf("mflag = %d, inFilePath = %s, labelFilePath = %s, outFilePath = %s\n",
+           mflag, inFilePath, labelFilePath, outFilePath);
 
-    return addMarkersToWaveFile(inFilePath, markerFilePath, outFilePath, mflag);
+    return addLabelsToWaveFile(inFilePath, labelFilePath, outFilePath, mflag);
 }
