@@ -105,6 +105,8 @@ void uint32ToLittleEndianBytes(uint32_t uInt32Value, char out_LittleEndianBytes[
 uint16_t littleEndianBytesToUInt16(char littleEndianBytes[2]);
 void uint16ToLittleEndianBytes(uint16_t uInt16Value, char out_LittleEndianBytes[2]);
 
+uint32_t timeToIndex(float timestamp, FormatChunk formatChunk);
+
 // The main function
 
 enum CuePointMergingOption
@@ -855,6 +857,15 @@ void uint16ToLittleEndianBytes(uint16_t uInt16Value, char out_LittleEndianBytes[
         out_LittleEndianBytes[0] = uintValueBytes[1];
         out_LittleEndianBytes[1] = uintValueBytes[0];
     }
+}
+
+uint32_t timeToIndex(float timestamp, FormatChunk formatChunk)
+{
+    uint32_t index;
+    uint32_t sampleRate = littleEndianBytesToUInt32(formatChunk.sampleRate);
+    uint16_t numberOfChannels = littleEndianBytesToUInt16(formatChunk.numberOfChannels);
+    index = timestamp * sampleRate * numberOfChannels;
+    return index;
 }
 
 int main(int argc, char **argv)
