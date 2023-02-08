@@ -18,7 +18,6 @@
 #include <string.h>
 
 #include <ctype.h>
-#include <unistd.h> //not sure if this is needed
 
 #define WAVE_FORMAT_PCM 0x0001
 #define WAVE_FORMAT_IEEE_FLOAT 0x0003
@@ -77,10 +76,11 @@ typedef struct
 typedef struct
 {
     uint32_t locations[1000];
+    char labels[1000][500]; // Hacky Storage for Label strings. 500 characters per label should be plenty
     uint32_t count;
 } LabelInfo;
 
-LabelInfo readLabelFile(FILE *labelFile);
+LabelInfo readLabelFile(FILE *labelFile, FormatChunk formatChunk);
 
 int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, LabelInfo labelInfo, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk);
 
@@ -109,13 +109,7 @@ uint32_t timeToIndex(float timestamp, FormatChunk formatChunk);
 
 // The main function
 
-enum CuePointMergingOption
-{
-    MergeWithAnyExistingCuePoints = 0,
-    ReplaceAnyExistingCuePoints
-};
-
-static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outFilePath, enum CuePointMergingOption mergeOption)
+static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outFilePath)
 {
 
     int returnCode = 0;
@@ -406,7 +400,7 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
     // Read in the Label File
     fprintf(stdout, "Reading label file.\n");
 
-    LabelInfo labelInfo = readLabelFile(labelFile);
+    LabelInfo labelInfo = readLabelFile(labelFile, *formatChunk);
 
     // Did we get any LabelInfo?
     if (labelInfo.count < 1)
@@ -443,12 +437,6 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
         uint32ToLittleEndianBytes(labelInfo.locations[i], cueChunk.cuePoints[i].frameOffset);
     }
 
-    // If necesary, merge the cuePoints with any existing cue points from the input file
-    if ((mergeOption == MergeWithAnyExistingCuePoints) && (existingCueChunk.cuePoints != NULL))
-    {
-        //...
-    }
-
     // Populate the CueChunk Struct
     cueChunk.chunkID[0] = 'c';
     cueChunk.chunkID[1] = 'u';
@@ -458,10 +446,10 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
     uint32ToLittleEndianBytes(labelInfo.count, cueChunk.cuePointsCount);
 
     // Open the output file for writing
-    outputFile = fopen(outFilePath, "wb");
+    outputFile = fopen(outFilePath, "w+b");
     if (outputFile == NULL)
     {
-        fprintf(stderr, "Could not open output file %s\n", outFilePath);
+        fprintf(stderr, "Could not open output file %s\nError: %d\n", outFilePath, errno);
         returnCode = -1;
         goto CleanUpAndExit;
     }
@@ -494,31 +482,56 @@ CleanUpAndExit:
     return returnCode;
 }
 
-LabelInfo readLabelFile(FILE *labelFile)
+LabelInfo readLabelFile(FILE *labelFile, FormatChunk formatChunk)
 {
-    // The label file should follow the standard format exported by audacity "startTime(sec) \t endTime(sec) \t Label \n"
+    // The label file should follow the standard format exported by audacity "startTime(sec) \t endTime(sec) \t Label \n" endTime will be ignored
     LabelInfo labelInfo = {
         .locations = {0},
+        .labels = {0},
         .count = 0};
+
+    int lineNumber = 1;
 
     while (!feof(labelFile))
     {
-        char labelInfotring[11] = {0}; // Max Value for a 32 bit int is 4,294,967,295, i.e. 10 numeric digits, so char[11] should be enough storage for all the digits in a line + a terminator (\0).
-        int charIndex = 0;
+        float startTime = 0.0;
+        char *labelString; // Labels are unlikely to exceed 500 characters.
 
-        // Loop through each line in the label file
-        while (1)
+        if (fscanf(labelFile, "%f%*f%*c%[^\r\n]%*c", &startTime, labelString) != 2)
         {
-            int nextChar = fgetc(labelFile);
 
-            // check for end of file
-            if (feof(labelFile))
+            fprintf(stderr, "Line %d in label file is not formatted correctly it should be \"startTime(sec) \\t endTime(sec) \\t Label \\n\"", lineNumber);
+        }
+        else
+        {
+            if (startTime <= 48660)
             {
-                labelInfotring[charIndex] = '\0';
-                break;
+                labelInfo.locations[labelInfo.count] = timeToIndex(startTime, formatChunk);
+                strcpy(labelInfo.labels[labelInfo.count], labelString);
+                labelInfo.count++;
             }
+            else
+            {
+                fprintf(stderr, "Line %d in label file contains a value larger than the max possible wav length (48,660.0 seconds)\n", lineNumber);
+            }
+        }
 
-            // check for end of line
+        int nextChar = fgetc(labelFile);
+
+        if (nextChar == '\r')
+        {
+            // This is a Classic Mac line ending '\r' or the start of a Windows line ending '\r\n'
+            // If this is the start of a '\r\n', gobble up the '\n' too
+            int peekAheadChar = fgetc(labelFile);
+            if ((peekAheadChar != EOF) && (peekAheadChar != '\n'))
+            {
+                ungetc(peekAheadChar, labelFile);
+            }
+        }
+
+        nextChar = fgetc(labelFile);
+        if (!feof(labelFile))
+        {
             if (nextChar == '\r')
             {
                 // This is a Classic Mac line ending '\r' or the start of a Windows line ending '\r\n'
@@ -528,52 +541,14 @@ LabelInfo readLabelFile(FILE *labelFile)
                 {
                     ungetc(peekAheadChar, labelFile);
                 }
-
-                labelInfotring[charIndex] = '\0';
-                break;
-            }
-            if (nextChar == '\n')
-            {
-                // This is a Unix/ OS X line ending '\n'
-                labelInfotring[charIndex] = '\0';
-                break;
-            }
-
-            if ((nextChar == '0') || (nextChar == '1') || (nextChar == '2') || (nextChar == '3') || (nextChar == '4') || (nextChar == '5') || (nextChar == '6') || (nextChar == '7') || (nextChar == '8') || (nextChar == '9'))
-            {
-                // This is a regular numeric character, if there are less than 10 digits in the labelInfotring, add this character.
-                // More than 10 digits is too much for a 32bit unsigned integer, so ignore this character and spin through the loop until we hit EOL or EOF
-                if (charIndex < 10)
-                {
-                    labelInfotring[charIndex] = (char)nextChar;
-                    charIndex++;
-                }
-                else
-                {
-                    fprintf(stderr, "Line %d in label file contains too many numeric digits (>10). Max value for a sample location is 4,294,967,295\n", labelInfo.count + 1);
-                }
             }
             else
             {
-                // This is an invalid character
-                fprintf(stderr, "Invalid character in label file: \'%c\' at line %d column %d.  Ignoring this character\n", nextChar, labelInfo.count + 1, charIndex + 1);
+                ungetc(nextChar, labelFile);
             }
         }
 
-        // Convert the digits from the line to a uint32 and add to labelInfo
-        if (strlen(labelInfotring) > 0)
-        {
-            long cueLocation_Long = strtol(labelInfotring, NULL, 10);
-            if (cueLocation_Long < UINT32_MAX)
-            {
-                labelInfo.locations[labelInfo.count] = (uint32_t)cueLocation_Long;
-                labelInfo.count++;
-            }
-            else
-            {
-                fprintf(stderr, "Line %d in label file contains a value larger than the max possible sample location value\n", labelInfo.count + 1);
-            }
-        }
+        lineNumber++;
     }
 
     return labelInfo;
@@ -870,45 +845,22 @@ uint32_t timeToIndex(float timestamp, FormatChunk formatChunk)
 
 int main(int argc, char **argv)
 {
-    enum CuePointMergingOption mflag = ReplaceAnyExistingCuePoints;
     char *inFilePath = NULL;
     char *labelFilePath = NULL;
     char *outFilePath = NULL;
-    int index;
-    int c;
 
-    opterr = 0;
-    while ((c = getopt(argc, argv, "m")) != -1)
-        switch (c)
-        {
-        case 'm':
-            mflag = MergeWithAnyExistingCuePoints;
-            break;
-        case '?':
-            if (isprint(optopt))
-                fprintf(stderr, "Unknown option `-%c'.\n", optopt);
-            else
-                fprintf(stderr,
-                        "Unknown option character `\\x%x'.\n",
-                        optopt);
-            return 1;
-        default:
-            abort();
-        }
-
-    if ((argc - optind) != 3)
+    if (argc != 4)
     {
-        printf("Usage: wavecuepoint [-m] WAVFILE labelFILE OUTPUTFILE\nOptions:\n\t-m\tMerge any existing cue points (default is replace)\n");
+        printf("Usage: wav-marker WAVFILE labelFILE OUTPUTFILE\n%d", argc);
         return 1;
     }
 
-    index = optind;
-    inFilePath = argv[index++];
-    labelFilePath = argv[index++];
-    outFilePath = argv[index++];
+    inFilePath = argv[1];
+    labelFilePath = argv[2];
+    outFilePath = argv[3];
 
-    printf("mflag = %d, inFilePath = %s, labelFilePath = %s, outFilePath = %s\n",
-           mflag, inFilePath, labelFilePath, outFilePath);
+    printf("inFilePath = %s, labelFilePath = %s, outFilePath = %s\n",
+           inFilePath, labelFilePath, outFilePath);
 
-    return addLabelsToWaveFile(inFilePath, labelFilePath, outFilePath, mflag);
+    return addLabelsToWaveFile(inFilePath, labelFilePath, outFilePath);
 }
