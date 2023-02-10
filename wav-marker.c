@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include <ctype.h>
 
@@ -65,6 +66,15 @@ typedef struct
     CuePoint *cuePoints;
 } CueChunk;
 
+// Cue Labels are stored in a ListChunk
+typedef struct
+{
+    char chunkID[4];       // String: Must be "LIST" (0x4C495354).
+    char chunkDataSize[4]; // Unsigned 4-byte little endian int: Byte count for the remainder of the chunk: 4 (size of TypeID) + Label chunks.
+    char typeID[4];        // String: Must be "adtl" (0x6164746C).
+    char *labelChunks;
+} ListChunk;
+
 // Some chunks we don't care about the contents and will just copy them from the input file to the output,
 // so this struct just stores positions of such chunks in the input file
 typedef struct
@@ -75,14 +85,15 @@ typedef struct
 
 typedef struct
 {
-    uint32_t locations[1000];
-    char labels[1000][500]; // Hacky Storage for Label strings. 500 characters per label should be plenty
+    uint32_t locations[500];
+    char labels[500][500]; // Hacky Storage for Label strings. 500 characters per label should be plenty
+    size_t labelLengths[500];
     uint32_t count;
 } LabelInfo;
 
 LabelInfo readLabelFile(FILE *labelFile, FormatChunk formatChunk);
 
-int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, LabelInfo labelInfo, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk);
+int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, LabelInfo labelInfo, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk, ListChunk listChunk, size_t listChunkSize);
 
 // For such chunks that we will copy over from input to output, this function does that in 1MB pieces
 int writeChunkLocationFromInputFileToOutputFile(ChunkLocation chunk, FILE *inputFile, FILE *outputFile);
@@ -119,11 +130,6 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
     WaveHeader *waveHeader = NULL;
     FormatChunk *formatChunk = NULL;
     ChunkLocation formatChunkExtraBytes = {0, 0};
-    CueChunk existingCueChunk = {
-        .chunkID = {0},
-        .chunkDataSize = {0},
-        .cuePointsCount = {0},
-        .cuePoints = NULL};
     ChunkLocation dataChunkLocation = {0, 0};
     const int maxOtherChunks = 256; // How many other chunks can we expect to find?  Who knows! So lets pull 256 out of the air.  That's a nice computery number.
     int otherChunksCount = 0;
@@ -135,7 +141,11 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
         .chunkDataSize = {0},
         .cuePointsCount = {0},
         .cuePoints = NULL};
-
+    ListChunk listChunk = {
+        .chunkID = {0},
+        .chunkDataSize = {0},
+        .typeID = {0},
+        .labelChunks = NULL};
     FILE *outputFile = NULL;
 
     // Open the Input File
@@ -310,81 +320,101 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
             }
             uint32_t cueChunkDataSize = littleEndianBytesToUInt32(cueChunkDataSizeBytes);
 
-            char cuePointsCountBytes[4];
-            fread(cuePointsCountBytes, sizeof(char), 4, inputFile);
-            if (ferror(inputFile) != 0)
+            // Skip over the chunk's data, and any padding byte
+            fseek(inputFile, cueChunkDataSize, SEEK_CUR);
+            if (cueChunkDataSize % 2 != 0)
             {
-                fprintf(stderr, "Error reading input file %s\n", inFilePath);
-                returnCode = -1;
-                goto CleanUpAndExit;
+                fseek(inputFile, 1, SEEK_CUR);
             }
-            uint32_t cuePointsCount = littleEndianBytesToUInt16(cuePointsCountBytes);
-
-            // Read in the existing cue points into CuePoint Structs
-            if (existingCueChunk.cuePoints)
-            {
-                fprintf(stderr, "Multiple existing Cue chunks found!\n");
-                returnCode = -1;
-                goto CleanUpAndExit;
-            }
-            existingCueChunk.cuePoints = (CuePoint *)malloc(sizeof(CuePoint) * cuePointsCount);
-            for (uint32_t cuePointIndex = 0; cuePointIndex < cuePointsCount; cuePointIndex++)
-            {
-                fread(&existingCueChunk.cuePoints[cuePointIndex], sizeof(CuePoint), 1, inputFile);
-                if (ferror(inputFile) != 0)
-                {
-                    fprintf(stderr, "Error reading input file %s\n", inFilePath);
-                    returnCode = -1;
-                    goto CleanUpAndExit;
-                }
-            }
-
-            // Populate the existingCueChunk struct
-            existingCueChunk.chunkID[0] = 'c';
-            existingCueChunk.chunkID[1] = 'u';
-            existingCueChunk.chunkID[2] = 'e';
-            existingCueChunk.chunkID[3] = ' ';
-            uint32ToLittleEndianBytes(cueChunkDataSize, existingCueChunk.chunkDataSize);
-            uint32ToLittleEndianBytes(cuePointsCount, existingCueChunk.cuePointsCount);
 
             printf("Found Existing Cue Chunk\n");
         }
 
         else
         {
-            // We have found a chunk type that we are not going to work with.  Just note the location so we can copy it to the output file later
+            bool isadtl = false;
 
-            if (otherChunksCount >= maxOtherChunks)
+            if ((strncmp(&nextChunkID[0], "LIST", 4) == 0))
             {
-                fprintf(stderr, "Input file has more chunks than the maximum supported by this program (%d)\n", maxOtherChunks);
-                returnCode = -1;
-                goto CleanUpAndExit;
+                char listTypeID[4];
+
+                char chunkDataSizeBytes[4] = {0};
+                fread(chunkDataSizeBytes, sizeof(char), 4, inputFile);
+                if (ferror(inputFile) != 0)
+                {
+                    fprintf(stderr, "Error reading input file %s\n", inFilePath);
+                    returnCode = -1;
+                    goto CleanUpAndExit;
+                }
+                uint32_t chunkDataSize = littleEndianBytesToUInt32(chunkDataSizeBytes);
+
+                fread(&listTypeID[0], sizeof(listTypeID), 1, inputFile);
+                if (feof(inputFile))
+                {
+                    break;
+                }
+
+                if (ferror(inputFile) != 0)
+                {
+                    fprintf(stderr, "Error reading input file %s\n", inFilePath);
+                    returnCode = -1;
+                    goto CleanUpAndExit;
+                }
+
+                if ((strncmp(&listTypeID[0], "adtl", 4) == 0))
+                {
+                    isadtl = true;
+                    printf("Found Existing Label Chunk\n");
+                    // Skip over the chunk's data, and any padding byte
+                    fseek(inputFile, chunkDataSize, SEEK_CUR);
+                    if (chunkDataSize % 2 != 0)
+                    {
+                        fseek(inputFile, 1, SEEK_CUR);
+                    }
+                }
+                else
+                {
+                    // if its not an adtl type go back and save chunk info
+                    fseek(inputFile, (-(long)((sizeof(char) * 4) + sizeof(listTypeID))), SEEK_CUR);
+                }
             }
 
-            otherChunkLocations[otherChunksCount].startOffset = ftell(inputFile) - (long)sizeof(nextChunkID);
-
-            char chunkDataSizeBytes[4] = {0};
-            fread(chunkDataSizeBytes, sizeof(char), 4, inputFile);
-            if (ferror(inputFile) != 0)
+            if (!isadtl)
             {
-                fprintf(stderr, "Error reading input file %s\n", inFilePath);
-                returnCode = -1;
-                goto CleanUpAndExit;
+                // We have found a chunk type that we are not going to work with.  Just note the location so we can copy it to the output file later
+
+                if (otherChunksCount >= maxOtherChunks)
+                {
+                    fprintf(stderr, "Input file has more chunks than the maximum supported by this program (%d)\n", maxOtherChunks);
+                    returnCode = -1;
+                    goto CleanUpAndExit;
+                }
+
+                otherChunkLocations[otherChunksCount].startOffset = ftell(inputFile) - (long)sizeof(nextChunkID);
+
+                char chunkDataSizeBytes[4] = {0};
+                fread(chunkDataSizeBytes, sizeof(char), 4, inputFile);
+                if (ferror(inputFile) != 0)
+                {
+                    fprintf(stderr, "Error reading input file %s\n", inFilePath);
+                    returnCode = -1;
+                    goto CleanUpAndExit;
+                }
+                uint32_t chunkDataSize = littleEndianBytesToUInt32(chunkDataSizeBytes);
+
+                otherChunkLocations[otherChunksCount].size = sizeof(nextChunkID) + sizeof(chunkDataSizeBytes) + chunkDataSize;
+
+                // Skip over the chunk's data, and any padding byte
+                fseek(inputFile, chunkDataSize, SEEK_CUR);
+                if (chunkDataSize % 2 != 0)
+                {
+                    fseek(inputFile, 1, SEEK_CUR);
+                }
+
+                otherChunksCount++;
+
+                fprintf(stdout, "Found chunk type \'%c%c%c%c\', size: %d bytes\n", nextChunkID[0], nextChunkID[1], nextChunkID[2], nextChunkID[3], chunkDataSize);
             }
-            uint32_t chunkDataSize = littleEndianBytesToUInt32(chunkDataSizeBytes);
-
-            otherChunkLocations[otherChunksCount].size = sizeof(nextChunkID) + sizeof(chunkDataSizeBytes) + chunkDataSize;
-
-            // Skip over the chunk's data, and any padding byte
-            fseek(inputFile, chunkDataSize, SEEK_CUR);
-            if (chunkDataSize % 2 != 0)
-            {
-                fseek(inputFile, 1, SEEK_CUR);
-            }
-
-            otherChunksCount++;
-
-            fprintf(stdout, "Found chunk type \'%c%c%c%c\', size: %d bytes\n", nextChunkID[0], nextChunkID[1], nextChunkID[2], nextChunkID[3], chunkDataSize);
         }
     }
 
@@ -421,11 +451,33 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
         goto CleanUpAndExit;
     }
 
-    //    uint16_t bitsPerSample = littleEndianBytesToUInt16(formatChunk->significantBitsPerSample);
-    //    uint16_t bytesPerSample = bitsPerSample / 8;
+    size_t listChunkSize = 0;
+
+    // calculate size of List Chunk
+    for (uint32_t i = 0; i < labelInfo.count; i++)
+    {
+        // chunkID (4) + Chunk Data Size (4) + Cuepoint ID (4) + Text
+        listChunkSize += (12 + labelInfo.labelLengths[i]);
+        // add padding byte
+        if ((labelInfo.labelLengths[i] % 2) != 0)
+        {
+            listChunkSize++;
+        }
+    }
+
+    listChunk.labelChunks = malloc(sizeof(char) * listChunkSize);
+    if (listChunk.labelChunks == NULL)
+    {
+        fprintf(stderr, "Memory Allocation Error: Could not allocate memory for Label data\n");
+        returnCode = -1;
+        goto CleanUpAndExit;
+    }
+
+    size_t listChunkIndex = 0;
 
     for (uint32_t i = 0; i < labelInfo.count; i++)
     {
+        // Cues
         uint32ToLittleEndianBytes(i + 1, cueChunk.cuePoints[i].cuePointID);
         uint32ToLittleEndianBytes(labelInfo.locations[i], cueChunk.cuePoints[i].playOrderPosition);
         cueChunk.cuePoints[i].dataChunkID[0] = 'd';
@@ -435,6 +487,31 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
         uint32ToLittleEndianBytes(0, cueChunk.cuePoints[i].chunkStart);
         uint32ToLittleEndianBytes(0, cueChunk.cuePoints[i].blockStart);
         uint32ToLittleEndianBytes(labelInfo.locations[i], cueChunk.cuePoints[i].frameOffset);
+
+        // Labels
+        listChunk.labelChunks[listChunkIndex++] = 'l';
+        listChunk.labelChunks[listChunkIndex++] = 'a';
+        listChunk.labelChunks[listChunkIndex++] = 'b';
+        listChunk.labelChunks[listChunkIndex++] = 'l';
+        char labelLength[4];
+        uint32ToLittleEndianBytes(labelInfo.labelLengths[i] + 4, labelLength);
+        listChunk.labelChunks[listChunkIndex++] = labelLength[0];
+        listChunk.labelChunks[listChunkIndex++] = labelLength[1];
+        listChunk.labelChunks[listChunkIndex++] = labelLength[2];
+        listChunk.labelChunks[listChunkIndex++] = labelLength[3];
+        listChunk.labelChunks[listChunkIndex++] = cueChunk.cuePoints[i].cuePointID[0];
+        listChunk.labelChunks[listChunkIndex++] = cueChunk.cuePoints[i].cuePointID[1];
+        listChunk.labelChunks[listChunkIndex++] = cueChunk.cuePoints[i].cuePointID[2];
+        listChunk.labelChunks[listChunkIndex++] = cueChunk.cuePoints[i].cuePointID[3];
+        for (uint32_t j = 0; j < labelInfo.labelLengths[i]; j++)
+        {
+            listChunk.labelChunks[listChunkIndex++] = labelInfo.labels[i][j];
+        }
+        // add padding if odd length
+        if ((labelInfo.labelLengths[i] % 2) != 0)
+        {
+            listChunk.labelChunks[listChunkIndex++] = 0;
+        }
     }
 
     // Populate the CueChunk Struct
@@ -445,6 +522,16 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
     uint32ToLittleEndianBytes(4 + (sizeof(CuePoint) * labelInfo.count), cueChunk.chunkDataSize); // See struct definition
     uint32ToLittleEndianBytes(labelInfo.count, cueChunk.cuePointsCount);
 
+    listChunk.chunkID[0] = 'L';
+    listChunk.chunkID[1] = 'I';
+    listChunk.chunkID[2] = 'S';
+    listChunk.chunkID[3] = 'T';
+    uint32ToLittleEndianBytes(4 + (sizeof(char) * listChunkSize), listChunk.chunkDataSize);
+    listChunk.typeID[0] = 'a';
+    listChunk.typeID[1] = 'd';
+    listChunk.typeID[2] = 't';
+    listChunk.typeID[3] = 'l';
+
     // Open the output file for writing
     outputFile = fopen(outFilePath, "w+b");
     if (outputFile == NULL)
@@ -454,7 +541,7 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
         goto CleanUpAndExit;
     }
 
-    returnCode = writeOutputFile(inputFile, outputFile, formatChunkExtraBytes, dataChunkLocation, otherChunksCount, otherChunkLocations, labelInfo, waveHeader, formatChunk, cueChunk);
+    returnCode = writeOutputFile(inputFile, outputFile, formatChunkExtraBytes, dataChunkLocation, otherChunksCount, otherChunkLocations, labelInfo, waveHeader, formatChunk, cueChunk, listChunk, listChunkSize);
     if (returnCode < 0)
     {
         goto CleanUpAndExit;
@@ -470,12 +557,12 @@ CleanUpAndExit:
         free(waveHeader);
     if (formatChunk != NULL)
         free(formatChunk);
-    if (existingCueChunk.cuePoints != NULL)
-        free(existingCueChunk.cuePoints);
     if (labelFile != NULL)
         fclose(labelFile);
     if (cueChunk.cuePoints != NULL)
         free(cueChunk.cuePoints);
+    if (listChunk.labelChunks != NULL)
+        free(listChunk.labelChunks);
     if (outputFile != NULL)
         fclose(outputFile);
 
@@ -488,6 +575,7 @@ LabelInfo readLabelFile(FILE *labelFile, FormatChunk formatChunk)
     LabelInfo labelInfo = {
         .locations = {0},
         .labels = {0},
+        .labelLengths = {0},
         .count = 0};
 
     int lineNumber = 1;
@@ -508,6 +596,7 @@ LabelInfo readLabelFile(FILE *labelFile, FormatChunk formatChunk)
             {
                 labelInfo.locations[labelInfo.count] = timeToIndex(startTime, formatChunk);
                 strcpy(labelInfo.labels[labelInfo.count], labelString);
+                labelInfo.labelLengths[labelInfo.count] = strlen(labelString) + 1;
                 labelInfo.count++;
             }
             else
@@ -554,7 +643,7 @@ LabelInfo readLabelFile(FILE *labelFile, FormatChunk formatChunk)
     return labelInfo;
 }
 
-int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, LabelInfo labelInfo, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk)
+int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunkExtraBytes, ChunkLocation dataChunkLocation, int otherChunksCount, ChunkLocation *otherChunkLocations, LabelInfo labelInfo, WaveHeader *waveHeader, FormatChunk *formatChunk, CueChunk cueChunk, ListChunk listChunk, size_t listChunkSize)
 {
     fprintf(stdout, "Writing output file.\n");
 
@@ -587,6 +676,11 @@ int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunk
     fileDataSize += 4; // UInt32 for CueChunk.cuePointsCount
     fileDataSize += (sizeof(CuePoint) * labelInfo.count);
 
+    fileDataSize += 4; // 4 bytes for ListChunk ID "LIST"
+    fileDataSize += 4; // UInt32 for ListChunk.chunkDataSize
+    fileDataSize += 4; // 4 bytes for TypeID "adtl"
+    fileDataSize += (sizeof(char) * listChunkSize);
+
     uint32ToLittleEndianBytes(fileDataSize, waveHeader->dataSize);
 
     // Write out the header to the new file
@@ -618,6 +712,20 @@ int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunk
         }
     }
 
+    // Write out the data chunk
+    if (writeChunkLocationFromInputFileToOutputFile(dataChunkLocation, inputFile, outputFile) < 0)
+    {
+        return -1;
+    }
+    if (dataChunkLocation.size % 2 != 0)
+    {
+        if (fwrite("\0", sizeof(char), 1, outputFile) < 1)
+        {
+            fprintf(stderr, "Error writing padding character to output file.\n");
+            return -1;
+        }
+    }
+
     // Write out the start of new Cue Chunk: chunkID, dataSize and cuePointsCount
     if (fwrite(&cueChunk, sizeof(cueChunk.chunkID) + sizeof(cueChunk.chunkDataSize) + sizeof(cueChunk.cuePointsCount), 1, outputFile) < 1)
     {
@@ -631,6 +739,31 @@ int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunk
         if (fwrite(&(cueChunk.cuePoints[i]), sizeof(CuePoint), 1, outputFile) < 1)
         {
             fprintf(stderr, "Error writing cue point to output file.\n");
+            return -1;
+        }
+    }
+
+    // Write out adtl chunk
+
+    // Write out the start of new List Chunk: chunkID, dataSize and TypeID
+    if (fwrite(&listChunk, sizeof(listChunk.chunkID) + sizeof(listChunk.chunkDataSize) + sizeof(listChunk.typeID), 1, outputFile) < 1)
+    {
+        fprintf(stderr, "Error writing adtl chunk header to output file.\n");
+        return -1;
+    }
+
+    // Write out the Labels
+    if (fwrite(&listChunk.labelChunks[0], listChunkSize, 1, outputFile) < 1)
+    {
+        fprintf(stderr, "Error writing labels to output file.\n");
+        return -1;
+    }
+
+    if ((listChunkSize % 2) != 0)
+    {
+        if (fwrite("\0", sizeof(char), 1, outputFile) < 1)
+        {
+            fprintf(stderr, "Error writing padding character to output file.\n");
             return -1;
         }
     }
@@ -649,20 +782,6 @@ int writeOutputFile(FILE *inputFile, FILE *outputFile, ChunkLocation formatChunk
                 fprintf(stderr, "Error writing padding character to output file.\n");
                 return -1;
             }
-        }
-    }
-
-    // Write out the data chunk
-    if (writeChunkLocationFromInputFileToOutputFile(dataChunkLocation, inputFile, outputFile) < 0)
-    {
-        return -1;
-    }
-    if (dataChunkLocation.size % 2 != 0)
-    {
-        if (fwrite("\0", sizeof(char), 1, outputFile) < 1)
-        {
-            fprintf(stderr, "Error writing padding character to output file.\n");
-            return -1;
         }
     }
 
