@@ -6,7 +6,7 @@ based off of [wavcuepoint.c](https://gist.github.com/TimMoore/a2dfb007004c87ac3a
 
 ## Usage
 
-wav-marker WAVFILE labelFILE OUTPUTFILE
+```wav-marker WAVFILE LABELFILE OUTPUTFILE```
 
 Label file should be in the format exported by audacity as described [here](https://manual.audacityteam.org/man/importing_and_exporting_labels.html)
 
