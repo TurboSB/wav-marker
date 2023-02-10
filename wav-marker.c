@@ -958,7 +958,7 @@ uint32_t timeToIndex(float timestamp, FormatChunk formatChunk)
     uint32_t index;
     uint32_t sampleRate = littleEndianBytesToUInt32(formatChunk.sampleRate);
     uint16_t numberOfChannels = littleEndianBytesToUInt16(formatChunk.numberOfChannels);
-    index = timestamp * sampleRate * numberOfChannels;
+    index = timestamp * sampleRate;
     return index;
 }
 
