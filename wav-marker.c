@@ -17,7 +17,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
-
+#include <errno.h>
 #include <ctype.h>
 
 #define WAVE_FORMAT_PCM 0x0001
@@ -585,9 +585,9 @@ LabelInfo readLabelFile(FILE *labelFile, FormatChunk formatChunk)
     while (!feof(labelFile))
     {
         float startTime = 0.0;
-        char *labelString; // Labels are unlikely to exceed 500 characters.
+        char labelString[500]; // Labels are unlikely to exceed 500 characters.
 
-        if (fscanf(labelFile, "%f%*f%*c%[^\r\n]%*c", &startTime, labelString) != 2)
+        if (fscanf(labelFile, "%f%*f%*c%[^\r\n]%*c", &startTime, &labelString) != 2)
         {
 
             fprintf(stderr, "Line %d in label file is not formatted correctly it should be \"startTime(sec) \\t endTime(sec) \\t Label \\n\"", lineNumber);
