@@ -1,7 +1,7 @@
 /** @file wav-labeler.c
  *
  * @author Mike Bucceroni
- * @date 2023-02-04
+ * @date 2023-02-10
  * @details program reads a .wav file and a label file as exported by Audacity
  * and creates a new .wav file with embedded cue points and text for each label
  * in a format that works with the podcasting application Forecast
@@ -366,7 +366,7 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
                     isadtl = true;
                     printf("Found Existing Label Chunk\n");
                     // Skip over the chunk's data, and any padding byte
-                    fseek(inputFile, chunkDataSize, SEEK_CUR);
+                    fseek(inputFile, chunkDataSize - (sizeof(char) * 4), SEEK_CUR);
                     if (chunkDataSize % 2 != 0)
                     {
                         fseek(inputFile, 1, SEEK_CUR);
@@ -375,7 +375,7 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
                 else
                 {
                     // if its not an adtl type go back and save chunk info
-                    fseek(inputFile, (-(long)((sizeof(char) * 4) + sizeof(listTypeID))), SEEK_CUR);
+                    fseek(inputFile, (-1 * (long)((sizeof(char) * 4) + sizeof(listTypeID))), SEEK_CUR);
                 }
             }
 
@@ -450,6 +450,8 @@ static int addLabelsToWaveFile(char *inFilePath, char *labelFilePath, char *outF
         returnCode = -1;
         goto CleanUpAndExit;
     }
+
+    fprintf(stdout, "Preparing new label chunk.\n");
 
     size_t listChunkSize = 0;
 
